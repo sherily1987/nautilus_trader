@@ -290,6 +290,10 @@ class BreakoutStrategy(Strategy):
         self._highs: list[float] = []
         self._lows: list[float] = []
         self._count = 0
+        self._pos = 0.0
+        self._entry_px = 0.0
+        self._entry_fee = 0.0
+        self._queue: list[dict] = []
         self.fills: list[dict] = []
         self.logs: list[str] = []
 
@@ -314,26 +318,50 @@ class BreakoutStrategy(Strategy):
         net = self._net_qty()
         step = self._qty_step()
         if net > step and close < exit_low:
-            self._flatten(close)
+            self._flatten(close, f"收盘 {close:.2f} 跌破离场低点 {exit_low:.2f}")
         elif net < -step and close > exit_high:
-            self._flatten(close)
+            self._flatten(close, f"收盘 {close:.2f} 升破离场高点 {exit_high:.2f}")
         elif abs(net) < step and close > upper and self._side != "short":
-            self._rebalance(OrderSide.BUY, close)
+            self._rebalance(OrderSide.BUY, close, f"收盘 {close:.2f} 突破前高 {upper:.2f}")
         elif abs(net) < step and close < lower and self._side != "long":
-            self._rebalance(OrderSide.SELL, close)
+            self._rebalance(OrderSide.SELL, close, f"收盘 {close:.2f} 跌破前低 {lower:.2f}")
         if len(self._highs) > needed + 2:
             self._highs = self._highs[-(needed + 2) :]
             self._lows = self._lows[-(needed + 2) :]
 
     def on_order_filled(self, event) -> None:
-        commission = event.commission
+        commission = _num(event.commission)
+        price = _num(event.last_px)
+        qty = _num(event.last_qty)
+        buy = bool(event.is_buy)
+        meta = self._queue.pop(0) if self._queue else {}
+        was = self._pos
+        self._pos += qty if buy else -qty
+        trade_pnl = None
+        step = self._qty_step()
+        if abs(was) < step and abs(self._pos) >= step:
+            self._entry_px = price
+            self._entry_fee = commission
+        elif abs(self._pos) < step and abs(was) >= step:
+            closed = abs(was)
+            gross = (price - self._entry_px) * closed if was > 0 else (self._entry_px - price) * closed
+            trade_pnl = gross - self._entry_fee - commission
         self.fills.append(
             {
                 "time": int(event.ts_event // 1_000_000_000),
-                "side": "BUY" if event.is_buy else "SELL",
-                "price": _num(event.last_px),
-                "qty": _num(event.last_qty),
-                "commission": _num(commission),
+                "side": "BUY" if buy else "SELL",
+                "action": meta.get("action", "买入" if buy else "卖出"),
+                "reason": meta.get("reason", ""),
+                "orderType": "市价",
+                "status": "已成交",
+                "orderId": meta.get("orderId", ""),
+                "signal": meta.get("signal", price),
+                "price": price,
+                "qty": qty,
+                "notional": price * qty,
+                "commission": commission,
+                "pnl": trade_pnl,
+                "position": self._pos,
             },
         )
 
@@ -348,39 +376,41 @@ class BreakoutStrategy(Strategy):
             return float(position.as_double())
         return float(position)
 
-    def _rebalance(self, side: OrderSide, price: float) -> None:
+    def _rebalance(self, side: OrderSide, price: float, reason: str) -> None:
         current = self._net_qty()
         target = float(self._quantity if side == OrderSide.BUY else -self._quantity)
         delta = target - current
         if abs(delta) < self._qty_step():
             return
         order_side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-        amount = abs(delta)
-        self.submit_order(
-            self.order_factory.market(
-                instrument_id=self._bar_type.instrument_id,
-                order_side=order_side,
-                quantity=self._make_qty(amount),
-                time_in_force=TimeInForce.GTC,
-            ),
-        )
-        label = "买入" if order_side == OrderSide.BUY else "卖出"
-        self._note(f"{label} {amount:.8g} @ {price}")
+        action = "开多" if order_side == OrderSide.BUY else "开空"
+        self._submit(order_side, abs(delta), action, reason, price)
 
-    def _flatten(self, price: float) -> None:
+    def _flatten(self, price: float, reason: str) -> None:
         current = self._net_qty()
         if abs(current) < self._qty_step():
             return
         order_side = OrderSide.SELL if current > 0 else OrderSide.BUY
-        self.submit_order(
-            self.order_factory.market(
-                instrument_id=self._bar_type.instrument_id,
-                order_side=order_side,
-                quantity=self._make_qty(abs(current)),
-                time_in_force=TimeInForce.GTC,
-            ),
+        action = "平多" if current > 0 else "平空"
+        self._submit(order_side, abs(current), action, reason, price)
+
+    def _submit(self, order_side: OrderSide, amount: float, action: str, reason: str, signal: float) -> None:
+        order = self.order_factory.market(
+            instrument_id=self._bar_type.instrument_id,
+            order_side=order_side,
+            quantity=self._make_qty(amount),
+            time_in_force=TimeInForce.GTC,
         )
-        self._note(f"平仓 {abs(current):.8g} @ {price}")
+        self._queue.append(
+            {
+                "action": action,
+                "reason": reason,
+                "signal": signal,
+                "orderId": str(order.client_order_id),
+            },
+        )
+        self.submit_order(order)
+        self._note(f"{action} 市价 {amount:.8g} @ {signal:.2f}，{reason}")
 
     def _qty_step(self) -> float:
         if self._size_precision <= 0:

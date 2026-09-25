@@ -82,6 +82,13 @@ function money(value) {
   return `${sign}${number.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function positionText(value) {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  const number = Number(value);
+  if (Math.abs(number) < 1e-8) return "空仓";
+  return `${number > 0 ? "多" : "空"} ${fmtQty(Math.abs(number))}`;
+}
+
 function stamp(unix) {
   const date = new Date(unix * 1000);
   const pad = (part) => String(part).padStart(2, "0");
@@ -138,11 +145,16 @@ function renderTables(payload) {
   fills.innerHTML = (payload.fills || []).slice().reverse().map((fill) => `
     <tr>
       <td>${stamp(fill.time)}</td>
-      <td class="${fill.side === "BUY" ? "up" : "down"}">${fill.side === "BUY" ? "买入" : "卖出"}</td>
+      <td class="${fill.side === "BUY" ? "up" : "down"}">${fill.action || (fill.side === "BUY" ? "买入" : "卖出")}</td>
+      <td>${fill.reason || "—"}</td>
+      <td>${fill.orderType || "市价"} · ${fill.status || "已成交"}</td>
       <td>${fmt(fill.price)}</td>
       <td>${fmtQty(fill.qty)}</td>
+      <td>${fmt(fill.notional || fill.price * fill.qty)}</td>
       <td>${Number(fill.commission).toFixed(2)}</td>
-    </tr>`).join("") || `<tr><td class="empty" colspan="5">还没有成交</td></tr>`;
+      <td class="${fill.pnl == null ? "" : fill.pnl >= 0 ? "up" : "down"}">${fill.pnl == null ? "—" : money(fill.pnl)}</td>
+      <td>${positionText(fill.position)}</td>
+    </tr>`).join("") || `<tr><td class="empty" colspan="10">还没有模拟订单</td></tr>`;
   positions.innerHTML = (payload.positions || []).slice().reverse().map((row) => `
     <tr>
       <td class="${row.side === "多" ? "up" : "down"}">${row.side}</td>
