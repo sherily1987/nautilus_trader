@@ -136,6 +136,7 @@ def _warm() -> None:
     try:
         engine.watchlist()
         READY = True
+        threading.Thread(target=engine.market.warm_taker, daemon=True).start()
     except Exception as exc:
         BOOT_ERROR = str(exc)
 

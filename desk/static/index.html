@@ -24,6 +24,12 @@
       <button type="button" data-interval="60">1H</button>
       <button type="button" data-interval="240" class="active">4H</button>
     </div>
+    <div class="indicators" id="indicators">
+      <button type="button" data-ind="split" title="每根成交量拆成主动买入（多，绿）和主动卖出（空，红）">多空量</button>
+      <button type="button" data-ind="volma" title="成交量 20 均线">VOL MA</button>
+      <button type="button" data-ind="vwap" title="成交量加权均价，按日重置">VWAP</button>
+      <button type="button" data-ind="obv" title="能量潮，上涨累加成交量，下跌扣减">OBV</button>
+    </div>
     <div class="top-status" id="status">正在连接引擎</div>
   </header>
 
@@ -39,8 +45,10 @@
     <div class="legend" id="legend">
       <b id="legend-symbol">EURUSD</b>
       <span id="legend-ohlc">加载行情…</span>
+      <span id="legend-ind"></span>
     </div>
     <div id="chart"></div>
+    <div id="split-labels" class="split-labels"></div>
   </main>
 
   <aside class="side">

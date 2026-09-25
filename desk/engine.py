@@ -222,7 +222,7 @@ def watchlist() -> list[dict]:
 def live_view(symbol: str, interval: str, fast: int = 120, slow: int = 10) -> dict:
     """Real exchange candles plus EMA overlays."""
     _validate(symbol, interval, fast, slow, SYMBOLS[symbol]["qty"])
-    bars = market.load_bars(symbol, interval)
+    bars = market.with_taker(symbol, interval, market.load_bars(symbol, interval))
     quote = market.ticker(symbol)
     return {
         "symbol": symbol,
@@ -245,7 +245,7 @@ def live_tail(symbol: str, interval: str, fast: int = 120, slow: int = 10) -> di
     fast_line = channel_line(bars, fast, "high")
     slow_line = channel_line(bars, fast, "low")
     return {
-        "bar": bars[-1],
+        "bar": market.with_taker(symbol, interval, bars[-1:])[0],
         "emaFast": fast_line[-1] if fast_line else None,
         "emaSlow": slow_line[-1] if slow_line else None,
         "live": True,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.request
 
 
@@ -22,9 +23,20 @@ OKX_BAR = {
     "240": "4H",
 }
 LIVE_SYMBOLS = {"BTCUSDT"}
+# Taker buy/sell volume is only published for these periods.
+TAKER_PERIOD = {
+    "5": "5m",
+    "15": "15m",
+    "60": "1H",
+    "240": "4H",
+}
+TAKER_REFRESH_SECONDS = 5
 
 _LOCK = threading.Lock()
 _BARS: dict[tuple[str, str], list[dict]] = {}
+_TAKER: dict[str, dict[int, tuple[float, float]]] = {}
+_TAKER_AT: dict[str, float] = {}
+_TAKER_LOCKS = {interval: threading.Lock() for interval in TAKER_PERIOD}
 
 
 def is_live(symbol: str) -> bool:
@@ -128,6 +140,77 @@ def refresh_tail(symbol: str, interval: str) -> list[dict]:
     with _LOCK:
         _BARS[key] = merged
     return merged
+
+
+def _taker_page(interval: str, limit: int, end: str | None = None) -> list[list]:
+    path = (
+        f"/api/v5/rubik/stat/taker-volume-contract?instId={INST_ID}"
+        f"&period={TAKER_PERIOD[interval]}&unit=0&limit={limit}"
+    )
+    if end is not None:
+        path += f"&end={end}"
+    return list(_get(path)["data"])
+
+
+def _taker_history(interval: str, limit: int) -> dict[int, tuple[float, float]]:
+    rows: list[list] = []
+    end = None
+    while len(rows) < limit:
+        size = min(100, limit - len(rows))
+        page = _taker_page(interval, size, end)
+        if not page:
+            break
+        rows.extend(page)
+        end = page[-1][0]
+        if len(page) < size:
+            break
+        time.sleep(0.45)
+    return {int(row[0]) // 1000: (float(row[2]), float(row[1])) for row in rows}
+
+
+def _taker(interval: str) -> dict[int, tuple[float, float]]:
+    """Taker volume keyed by bar open time: (buy, sell) in BTC."""
+    with _TAKER_LOCKS[interval]:
+        with _LOCK:
+            cached = _TAKER.get(interval)
+            fetched_at = _TAKER_AT.get(interval, 0.0)
+        if cached is None:
+            fresh = _taker_history(interval, 1000)
+        elif time.monotonic() - fetched_at >= TAKER_REFRESH_SECONDS:
+            fresh = {**cached, **_taker_history(interval, 2)}
+        else:
+            return cached
+        with _LOCK:
+            _TAKER[interval] = fresh
+            _TAKER_AT[interval] = time.monotonic()
+        return fresh
+
+
+def warm_taker() -> None:
+    """Fetch taker history for every supported period ahead of the first chart."""
+    for interval in ("240", "60", "15", "5"):
+        try:
+            _taker(interval)
+        except Exception:
+            continue
+
+
+def with_taker(symbol: str, interval: str, bars: list[dict]) -> list[dict]:
+    """Copies of the bars with buyVol and sellVol where OKX publishes them."""
+    if symbol not in LIVE_SYMBOLS or interval not in TAKER_PERIOD:
+        return bars
+    try:
+        split = _taker(interval)
+    except Exception:
+        return bars
+    out = []
+    for bar in bars:
+        pair = split.get(bar["time"])
+        if pair is None:
+            out.append(bar)
+        else:
+            out.append({**bar, "buyVol": pair[0], "sellVol": pair[1]})
+    return out
 
 
 def ticker(symbol: str) -> dict:
