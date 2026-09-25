@@ -58,7 +58,7 @@ class DeskHandler(BaseHTTPRequestHandler):
             result = engine.run_backtest(
                 symbol=str(body.get("symbol", "EURUSD")),
                 interval=str(body.get("interval", "15")),
-                fast=int(body["fast"]) if "fast" in body else 20,
+                fast=int(body["fast"]) if "fast" in body else 120,
                 slow=int(body["slow"]) if "slow" in body else 10,
                 qty=float(body["qty"]) if "qty" in body else engine.SYMBOLS.get(str(body.get("symbol", "EURUSD")), {}).get("qty", 100_000),
                 side=str(body.get("side", "both")),
@@ -74,7 +74,7 @@ class DeskHandler(BaseHTTPRequestHandler):
     def _query_chart(self, query: dict) -> tuple[str, str, int, int]:
         symbol = query.get("symbol", ["BTCUSDT"])[0]
         interval = query.get("interval", ["15"])[0]
-        fast = int(query.get("fast", ["20"])[0])
+        fast = int(query.get("fast", ["120"])[0])
         slow = int(query.get("slow", ["10"])[0])
         return symbol, interval, fast, slow
 

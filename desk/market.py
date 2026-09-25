@@ -51,6 +51,7 @@ def _bar(row: list) -> dict:
         "low": float(row[3]),
         "close": float(row[4]),
         "volume": float(row[6]),
+        "closed": row[8] == "1",
     }
 
 

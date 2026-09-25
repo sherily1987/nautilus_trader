@@ -19,7 +19,7 @@ function fmtQty(value) {
 
 const state = {
   symbol: "BTCUSDT",
-  interval: "60",
+  interval: "240",
   side: "both",
   tool: "cursor",
   digits: 2,
@@ -148,10 +148,10 @@ function renderTables(payload) {
       <td class="${fill.side === "BUY" ? "up" : "down"}">${fill.action || (fill.side === "BUY" ? "买入" : "卖出")}</td>
       <td>${fill.reason || "—"}</td>
       <td>${fill.orderType || "市价"} · ${fill.status || "已成交"}</td>
-      <td>${fmt(fill.price)}</td>
+      <td>${fill.price == null ? "下一根开盘" : fmt(fill.price)}</td>
       <td>${fmtQty(fill.qty)}</td>
-      <td>${fmt(fill.notional || fill.price * fill.qty)}</td>
-      <td>${Number(fill.commission).toFixed(2)}</td>
+      <td>${fill.notional == null ? "—" : fmt(fill.notional)}</td>
+      <td>${fill.commission == null ? "—" : Number(fill.commission).toFixed(2)}</td>
       <td class="${fill.pnl == null ? "" : fill.pnl >= 0 ? "up" : "down"}">${fill.pnl == null ? "—" : money(fill.pnl)}</td>
       <td>${positionText(fill.position)}</td>
     </tr>`).join("") || `<tr><td class="empty" colspan="10">还没有模拟订单</td></tr>`;
@@ -171,7 +171,9 @@ function renderTables(payload) {
   const pnl = document.getElementById("stat-pnl");
   pnl.textContent = money(payload.stats.pnl) + unit;
   pnl.className = payload.stats.pnl >= 0 ? "up" : "down";
-  document.getElementById("stat-win").textContent = payload.stats.winRate === null ? "—" : `${payload.stats.winRate.toFixed(1)}%`;
+  document.getElementById("stat-win").textContent = payload.stats.winRate === null
+    ? "—"
+    : `${payload.stats.winRate.toFixed(1)}% (${payload.stats.wins}/${payload.stats.closed})`;
   document.getElementById("stat-trades").textContent = String(payload.stats.trades);
 }
 
@@ -312,7 +314,7 @@ async function runBacktest() {
     }
     applyChart(payload);
     renderTables(payload);
-    const count = payload.fills ? payload.fills.length : 0;
+    const count = payload.stats ? payload.stats.trades : 0;
     if (payload.live) {
       state.live = true;
       startLive();

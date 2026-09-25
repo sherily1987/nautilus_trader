@@ -15,15 +15,20 @@ from nautilus_trader.common import LogLevel
 from nautilus_trader.common import LoggerConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.execution import MakerTakerFeeModel
+from nautilus_trader.execution import StaticLatencyModel
 from nautilus_trader.model import AccountType
+from nautilus_trader.model import AggressorSide
 from nautilus_trader.model import Bar
 from nautilus_trader.model import Currency
 from nautilus_trader.model import BarType
+from nautilus_trader.model import CryptoPerpetual
 from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TradeId
+from nautilus_trader.model import TradeTick
 from nautilus_trader.model import TraderId
 from nautilus_trader.model import Venue
 from nautilus_trader.testkit.providers import TestInstrumentProvider
@@ -214,7 +219,7 @@ def watchlist() -> list[dict]:
     return quotes
 
 
-def live_view(symbol: str, interval: str, fast: int = 20, slow: int = 10) -> dict:
+def live_view(symbol: str, interval: str, fast: int = 120, slow: int = 10) -> dict:
     """Real exchange candles plus EMA overlays."""
     _validate(symbol, interval, fast, slow, SYMBOLS[symbol]["qty"])
     bars = market.load_bars(symbol, interval)
@@ -233,7 +238,7 @@ def live_view(symbol: str, interval: str, fast: int = 20, slow: int = 10) -> dic
     }
 
 
-def live_tail(symbol: str, interval: str, fast: int = 20, slow: int = 10) -> dict:
+def live_tail(symbol: str, interval: str, fast: int = 120, slow: int = 10) -> dict:
     """Latest forming candle for the live chart."""
     _validate(symbol, interval, fast, slow, SYMBOLS[symbol]["qty"])
     bars = market.refresh_tail(symbol, interval)
@@ -249,7 +254,7 @@ def live_tail(symbol: str, interval: str, fast: int = 20, slow: int = 10) -> dic
     }
 
 
-def chart(symbol: str, interval: str, fast: int = 20, slow: int = 10) -> dict:
+def chart(symbol: str, interval: str, fast: int = 120, slow: int = 10) -> dict:
     """Candles plus EMA overlays, without running a backtest."""
     _validate(symbol, interval, fast, slow, 1)
     bars = aggregate(generate_minutes(symbol), INTERVALS[interval])
@@ -293,7 +298,8 @@ class BreakoutStrategy(Strategy):
         self._pos = 0.0
         self._entry_px = 0.0
         self._entry_fee = 0.0
-        self._queue: list[dict] = []
+        self._orders: dict[str, dict] = {}
+        self._bar_ts = 0
         self.fills: list[dict] = []
         self.logs: list[str] = []
 
@@ -304,6 +310,7 @@ class BreakoutStrategy(Strategy):
 
     def on_bar(self, bar: Bar) -> None:
         close = bar.close.as_double()
+        self._bar_ts = bar.ts_event
         self._highs.append(bar.high.as_double())
         self._lows.append(bar.low.as_double())
         self._count += 1
@@ -334,7 +341,8 @@ class BreakoutStrategy(Strategy):
         price = _num(event.last_px)
         qty = _num(event.last_qty)
         buy = bool(event.is_buy)
-        meta = self._queue.pop(0) if self._queue else {}
+        meta = self._orders.get(str(event.client_order_id), {})
+        meta["filled"] = True
         was = self._pos
         self._pos += qty if buy else -qty
         trade_pnl = None
@@ -401,16 +409,44 @@ class BreakoutStrategy(Strategy):
             quantity=self._make_qty(amount),
             time_in_force=TimeInForce.GTC,
         )
-        self._queue.append(
-            {
-                "action": action,
-                "reason": reason,
-                "signal": signal,
-                "orderId": str(order.client_order_id),
-            },
-        )
+        self._orders[str(order.client_order_id)] = {
+            "action": action,
+            "reason": reason,
+            "signal": signal,
+            "orderId": str(order.client_order_id),
+            "side": "BUY" if order_side == OrderSide.BUY else "SELL",
+            "qty": amount,
+            "time": int(self._bar_ts // 1_000_000_000),
+            "filled": False,
+        }
         self.submit_order(order)
-        self._note(f"{action} 市价 {amount:.8g} @ {signal:.2f}，{reason}")
+        self._note(f"{action} 市价 {amount:.8g}，信号收盘 {signal:.2f}，下一根开盘成交，{reason}")
+
+    def pending(self) -> list[dict]:
+        """Signals from the last closed bar that execute at the next open."""
+        rows = []
+        for meta in self._orders.values():
+            if meta["filled"]:
+                continue
+            rows.append(
+                {
+                    "time": meta["time"],
+                    "side": meta["side"],
+                    "action": meta["action"],
+                    "reason": meta["reason"],
+                    "orderType": "市价",
+                    "status": "待成交",
+                    "orderId": meta["orderId"],
+                    "signal": meta["signal"],
+                    "price": None,
+                    "qty": meta["qty"],
+                    "notional": None,
+                    "commission": None,
+                    "pnl": None,
+                    "position": self._pos,
+                },
+            )
+        return rows
 
     def _qty_step(self) -> float:
         if self._size_precision <= 0:
@@ -428,9 +464,47 @@ class BreakoutStrategy(Strategy):
             del self.logs[: len(self.logs) - 200]
 
 
+# A signal is known only when its bar closes. Orders reach the venue after the
+# latency and fill against the next bar's open, which is replayed as a trade
+# tick just after that open.
+ORDER_LATENCY_NS = 1_000_000
+OPEN_TICK_DELAY_NS = 2_000_000
+
+PERP_MAKER_FEE = Decimal("0.0002")
+PERP_TAKER_FEE = Decimal("0.0005")
+
+
+def _btc_perpetual() -> CryptoPerpetual:
+    """BTCUSDT perpetual with standard-tier maker and taker fees."""
+    base = TestInstrumentProvider.btcusdt_perp_binance()
+    return CryptoPerpetual(
+        instrument_id=base.id,
+        raw_symbol=base.raw_symbol,
+        base_currency=base.base_currency,
+        quote_currency=base.quote_currency,
+        settlement_currency=base.settlement_currency,
+        is_inverse=base.is_inverse,
+        price_precision=base.price_precision,
+        size_precision=base.size_precision,
+        price_increment=base.price_increment,
+        size_increment=base.size_increment,
+        ts_event=0,
+        ts_init=0,
+        max_quantity=base.max_quantity,
+        min_quantity=base.min_quantity,
+        min_notional=base.min_notional,
+        max_price=base.max_price,
+        min_price=base.min_price,
+        margin_init=base.margin_init,
+        margin_maint=base.margin_maint,
+        maker_fee=PERP_MAKER_FEE,
+        taker_fee=PERP_TAKER_FEE,
+    )
+
+
 def _instrument(symbol: str):
     if symbol == "BTCUSDT":
-        return TestInstrumentProvider.btcusdt_perp_binance()
+        return _btc_perpetual()
     return TestInstrumentProvider.default_fx_ccy(symbol=symbol, venue=Venue(VENUE_NAME))
 
 
@@ -444,7 +518,7 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
         payload = live_view(symbol, interval, fast, slow)
     else:
         payload = chart(symbol, interval, fast, slow)
-    bars = payload["bars"]
+    bars = [item for item in payload["bars"] if item.get("closed", True)]
     instrument = _instrument(symbol)
     if symbol == "BTCUSDT":
         venue = instrument.venue
@@ -455,19 +529,36 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
         base_currency = USD
         balance = Money.from_str(f"{STARTING_BALANCE} USD")
     bar_type = BarType.from_str(f"{instrument.id}-{BAR_SPECS[interval]}-LAST-EXTERNAL")
-    nautilus_bars = [
-        Bar(
-            bar_type=bar_type,
-            open=instrument.make_price(float(f"{item['open']:.{SYMBOLS[symbol]['digits']}f}")),
-            high=instrument.make_price(float(f"{item['high']:.{SYMBOLS[symbol]['digits']}f}")),
-            low=instrument.make_price(float(f"{item['low']:.{SYMBOLS[symbol]['digits']}f}")),
-            close=instrument.make_price(float(f"{item['close']:.{SYMBOLS[symbol]['digits']}f}")),
-            volume=instrument.make_qty(float(item["volume"])),
-            ts_event=dt_to_unix_nanos(datetime.fromtimestamp(item["time"], tz=UTC)),
-            ts_init=dt_to_unix_nanos(datetime.fromtimestamp(item["time"], tz=UTC)),
+    digits = SYMBOLS[symbol]["digits"]
+    bar_ns = INTERVALS[interval] * 60 * 1_000_000_000
+    open_size = instrument.make_qty(float(SYMBOLS[symbol]["maxQty"]) * 10)
+    feed = []
+    for index, item in enumerate(bars):
+        opened = dt_to_unix_nanos(datetime.fromtimestamp(item["time"], tz=UTC))
+        open_px = instrument.make_price(float(f"{item['open']:.{digits}f}"))
+        feed.append(
+            TradeTick(
+                instrument.id,
+                open_px,
+                open_size,
+                AggressorSide.NO_AGGRESSOR,
+                TradeId(f"OPEN-{index}"),
+                opened + OPEN_TICK_DELAY_NS,
+                opened + OPEN_TICK_DELAY_NS,
+            ),
         )
-        for item in bars
-    ]
+        feed.append(
+            Bar(
+                bar_type=bar_type,
+                open=open_px,
+                high=instrument.make_price(float(f"{item['high']:.{digits}f}")),
+                low=instrument.make_price(float(f"{item['low']:.{digits}f}")),
+                close=instrument.make_price(float(f"{item['close']:.{digits}f}")),
+                volume=instrument.make_qty(float(item["volume"])),
+                ts_event=opened + bar_ns,
+                ts_init=opened + bar_ns,
+            ),
+        )
 
     engine = BacktestEngine(
         config=BacktestEngineConfig(
@@ -484,9 +575,10 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
             base_currency=base_currency,
             default_leverage=Decimal(20),
             fee_model=_fee_model(),
+            latency_model=StaticLatencyModel(base_latency_nanos=ORDER_LATENCY_NS),
         )
         engine.add_instrument(instrument)
-        engine.add_data(nautilus_bars)
+        engine.add_data(feed)
         strategy = BreakoutStrategy(bar_type, fast, slow, float(qty), side, instrument.size_precision)
         engine.add_strategy(strategy)
         with _LOCK:
@@ -496,14 +588,15 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
             _position_row(position, SYMBOLS[symbol]["digits"])
             for position in (*engine.cache.positions_closed(), *engine.cache.positions_open())
         ]
-        stats = _stats(engine, venue, positions, len(strategy.fills), SYMBOLS[symbol]["currency"])
+        stats = _stats(engine, venue, positions, strategy.fills, SYMBOLS[symbol]["currency"])
         markers = _markers(strategy.fills)
+        pending = strategy.pending()
     finally:
         engine.dispose()
 
     payload.update(
         {
-            "fills": strategy.fills,
+            "fills": strategy.fills + pending,
             "positions": positions,
             "markers": markers,
             "stats": stats,
@@ -537,8 +630,8 @@ def _position_row(position, digits: int) -> dict:
     }
 
 
-def _stats(engine: BacktestEngine, venue: Venue, positions: list[dict], fill_count: int, currency: str) -> dict:
-    closed = [item for item in positions if item["status"] == "已平"]
+def _stats(engine: BacktestEngine, venue: Venue, positions: list[dict], fills: list[dict], currency: str) -> dict:
+    closed = [item for item in fills if item["pnl"] is not None]
     wins = [item for item in closed if item["pnl"] > 0]
     pnl_map = engine.portfolio.total_pnls(venue)
     total = 0.0
@@ -548,7 +641,7 @@ def _stats(engine: BacktestEngine, venue: Venue, positions: list[dict], fill_cou
         "starting": STARTING_BALANCE,
         "pnl": total,
         "equity": STARTING_BALANCE + total,
-        "trades": fill_count,
+        "trades": len(fills),
         "closed": len(closed),
         "wins": len(wins),
         "winRate": (len(wins) / len(closed) * 100) if closed else None,
