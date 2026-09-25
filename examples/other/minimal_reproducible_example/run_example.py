@@ -138,10 +138,7 @@ def run_backtest() -> None:
         starting_balances=[Money.from_str("1000000 USD")],  # Initial account balance
         base_currency=USD,  # Base currency for account
         default_leverage=Decimal(1),  # No leverage used for account
-        fee_model=MakerTakerFeeModel(
-            maker_rate=Decimal("0.00002"),
-            taker_rate=Decimal("0.00002"),
-        ),
+        fee_model=MakerTakerFeeModel(),
     )
 
     # Step 3: Create instrument definition and add it to the engine
