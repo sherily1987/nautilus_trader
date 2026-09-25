@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nautilus Desk</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">N</span><span>Nautilus</span></div>
+    <button id="symbol-btn" class="symbol-btn" type="button">
+      <strong id="symbol-code">EURUSD</strong>
+      <span id="symbol-name">欧元/美元</span>
+    </button>
+    <div class="quote">
+      <span id="last-price">—</span>
+      <span id="last-change">—</span>
+    </div>
+    <div class="intervals" id="intervals">
+      <button type="button" data-interval="1">1m</button>
+      <button type="button" data-interval="5">5m</button>
+      <button type="button" data-interval="15">15m</button>
+      <button type="button" data-interval="60" class="active">1H</button>
+      <button type="button" data-interval="240">4H</button>
+    </div>
+    <div class="top-status" id="status">正在连接引擎</div>
+  </header>
+
+  <aside class="tools" id="tools">
+    <button type="button" class="active" data-tool="cursor" title="光标">+</button>
+    <button type="button" data-tool="cross" title="十字线">✛</button>
+    <button type="button" data-tool="hline" title="水平线">―</button>
+    <button type="button" data-tool="trend" title="趋势线">╱</button>
+    <button type="button" data-tool="clear" title="清除画线">⌫</button>
+  </aside>
+
+  <main class="chart-wrap">
+    <div class="legend" id="legend">
+      <b id="legend-symbol">EURUSD</b>
+      <span id="legend-ohlc">加载行情…</span>
+    </div>
+    <div id="chart"></div>
+  </main>
+
+  <aside class="side">
+    <section class="watch">
+      <header>自选</header>
+      <div id="watchlist"></div>
+    </section>
+    <section class="ticket">
+      <header>永续多空</header>
+      <div class="side-toggle" id="side-toggle">
+        <button type="button" data-side="long" class="buy">买入</button>
+        <button type="button" data-side="short" class="sell">卖出</button>
+        <button type="button" data-side="both" class="active">多空</button>
+      </div>
+      <label>数量<input id="qty" type="number" min="1" step="1000" value="100000" /></label>
+      <div class="pair">
+        <label>突破周期<input id="fast" type="number" min="5" max="200" value="20" /></label>
+        <label>离场周期<input id="slow" type="number" min="2" max="100" value="10" /></label>
+      </div>
+      <button id="run" class="run" type="button">运行回测</button>
+      <dl class="stats" id="stats">
+        <div><dt>权益</dt><dd id="stat-equity">—</dd></div>
+        <div><dt>盈亏</dt><dd id="stat-pnl">—</dd></div>
+        <div><dt>胜率</dt><dd id="stat-win">—</dd></div>
+        <div><dt>成交笔数</dt><dd id="stat-trades">—</dd></div>
+      </dl>
+    </section>
+  </aside>
+
+  <section class="bottom">
+    <nav class="tabs" id="tabs">
+      <button type="button" class="active" data-tab="fills">成交</button>
+      <button type="button" data-tab="positions">持仓</button>
+      <button type="button" data-tab="logs">日志</button>
+    </nav>
+    <div class="table-wrap" id="panel-fills">
+      <table>
+        <thead><tr><th>时间</th><th>方向</th><th>价格</th><th>数量</th><th>手续费</th></tr></thead>
+        <tbody id="fills-body"></tbody>
+      </table>
+    </div>
+    <div class="table-wrap hidden" id="panel-positions">
+      <table>
+        <thead><tr><th>方向</th><th>数量</th><th>开仓价</th><th>平仓价</th><th>盈亏</th><th>状态</th></tr></thead>
+        <tbody id="positions-body"></tbody>
+      </table>
+    </div>
+    <div class="table-wrap hidden" id="panel-logs"><ol id="log-list"></ol></div>
+  </section>
+
+  <script src="/lightweight-charts.standalone.production.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
