@@ -58,6 +58,10 @@
     </section>
     <section class="ticket">
       <header>永续多空</header>
+      <div class="strategy-toggle" id="strategy-toggle">
+        <button type="button" data-strategy="breakout" class="active">通道突破</button>
+        <button type="button" data-strategy="carver" title="Rob Carver 的突破预测：多周期平均、连续仓位、按波动率定仓">Carver 趋势</button>
+      </div>
       <div class="side-toggle" id="side-toggle">
         <button type="button" data-side="long" class="buy">买入</button>
         <button type="button" data-side="short" class="sell">卖出</button>
@@ -68,6 +72,7 @@
         <label>突破周期<input id="fast" type="number" min="5" max="200" value="120" /></label>
         <label>离场周期<input id="slow" type="number" min="2" max="100" value="10" /></label>
       </div>
+      <div class="strategy-note hidden" id="strategy-note">回看 10/20/40/80 天取平均，仓位随预测值和波动率连续调整。数量是基准仓位：预测 +10、波动率处于平均水平时持有这么多，最多 2 倍。只支持 1H、4H。</div>
       <button id="run" class="run" type="button">运行回测</button>
       <dl class="stats" id="stats">
         <div><dt>权益</dt><dd id="stat-equity">—</dd></div>
@@ -82,6 +87,9 @@
     <nav class="tabs" id="tabs">
       <button type="button" class="active" data-tab="fills">模拟订单</button>
       <button type="button" data-tab="positions">持仓</button>
+      <button type="button" data-tab="perf">绩效</button>
+      <button type="button" data-tab="robust">稳健性</button>
+      <button type="button" data-tab="forward">前向模拟</button>
       <button type="button" data-tab="logs">日志</button>
     </nav>
     <div class="table-wrap" id="panel-fills">
@@ -95,6 +103,37 @@
         <thead><tr><th>方向</th><th>数量</th><th>开仓价</th><th>平仓价</th><th>盈亏</th><th>状态</th></tr></thead>
         <tbody id="positions-body"></tbody>
       </table>
+    </div>
+    <div class="table-wrap hidden perf" id="panel-perf">
+      <dl class="perf-grid" id="perf-grid"><div><dt>绩效</dt><dd>运行回测后显示</dd></div></dl>
+      <div class="perf-chart" id="equity-chart"></div>
+    </div>
+    <div class="table-wrap hidden robust" id="panel-robust">
+      <div class="robust-summary">
+        <button id="run-robust" class="run small" type="button">运行稳健性检查</button>
+        <div id="robust-summary">用约一年的历史 K 线扫描当前参数周围的组合，并做滚动样本外检验。支持 15m、1H、4H。</div>
+      </div>
+      <div class="robust-grid" id="robust-grid"></div>
+      <div class="robust-walk" id="robust-walk"></div>
+    </div>
+    <div class="table-wrap hidden forward" id="panel-forward">
+      <div class="forward-runs">
+        <div class="forward-head">
+          <button id="start-forward" class="run small" type="button">用当前参数开始前向模拟</button>
+          <span id="forward-note">只记录模拟信号和模拟成交，不会向交易所下单。从开始后下一根收盘的 K 线起记录。</span>
+        </div>
+        <table>
+          <thead><tr><th>开始</th><th>策略</th><th>周期</th><th>方向</th><th>持仓</th><th>盈亏</th><th>资金费</th><th>信号</th><th>成交</th><th>状态</th><th></th></tr></thead>
+          <tbody id="forward-body"><tr><td class="empty" colspan="11">还没有前向模拟</td></tr></tbody>
+        </table>
+      </div>
+      <div class="forward-events">
+        <div class="muted-note" id="forward-events-title">最近事件</div>
+        <table>
+          <thead><tr><th>时间</th><th>类型</th><th>操作</th><th>说明</th></tr></thead>
+          <tbody id="forward-events"></tbody>
+        </table>
+      </div>
     </div>
     <div class="table-wrap hidden" id="panel-logs"><ol id="log-list"></ol></div>
   </section>

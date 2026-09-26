@@ -21,6 +21,7 @@ const state = {
   symbol: "BTCUSDT",
   interval: "240",
   side: "both",
+  strategy: "breakout",
   tool: "cursor",
   digits: 2,
   live: false,
@@ -417,6 +418,74 @@ function renderTables(payload) {
     ? "—"
     : `${payload.stats.winRate.toFixed(1)}% (${payload.stats.wins}/${payload.stats.closed})`;
   document.getElementById("stat-trades").textContent = String(payload.stats.trades);
+  renderPerformance(payload);
+}
+
+let equityChart = null;
+let equitySeries = null;
+
+function ensureEquityChart() {
+  if (equityChart) return;
+  equityChart = LightweightCharts.createChart(document.getElementById("equity-chart"), {
+    autoSize: true,
+    layout: { background: { type: "solid", color: "#131722" }, textColor: "#787b86", fontSize: 11 },
+    grid: { vertLines: { visible: false }, horzLines: { color: "#1f2430" } },
+    rightPriceScale: { borderColor: "#2a2e39" },
+    timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: false },
+    handleScroll: false,
+    handleScale: false,
+  });
+  equitySeries = equityChart.addBaselineSeries({
+    baseValue: { type: "price", price: 0 },
+    topLineColor: "#089981",
+    topFillColor1: "rgba(8,153,129,0.28)",
+    topFillColor2: "rgba(8,153,129,0.02)",
+    bottomLineColor: "#f23645",
+    bottomFillColor1: "rgba(242,54,69,0.02)",
+    bottomFillColor2: "rgba(242,54,69,0.28)",
+    lineWidth: 1,
+    priceLineVisible: false,
+  });
+}
+
+function metric(label, value, note = "", tone = "") {
+  return `<div><dt>${label}</dt><dd class="${tone}">${value}${note ? ` <small>${note}</small>` : ""}</dd></div>`;
+}
+
+function renderPerformance(payload) {
+  const perf = payload.performance;
+  const grid = document.getElementById("perf-grid");
+  if (!perf) {
+    grid.innerHTML = metric("绩效", "运行回测后显示");
+    return;
+  }
+  const unit = payload.stats && payload.stats.currency ? payload.stats.currency : "";
+  const bars = (payload.bars || []).filter((bar) => bar.closed !== false);
+  const days = bars.length > 1 ? (bars[bars.length - 1].time - bars[0].time) / 86400 : 0;
+  const tone = (value) => (value == null ? "" : value >= 0 ? "up" : "down");
+  const num = (value, digits = 2) => (value == null ? "—" : Number(value).toFixed(digits));
+  grid.innerHTML = [
+    metric("总盈亏", `${money(perf.curvePnl)} ${unit}`, "", tone(perf.curvePnl)),
+    metric("夏普（年化）", num(perf.sharpe), days < 90 ? `样本 ${days.toFixed(0)} 天，偏少` : `样本 ${days.toFixed(0)} 天`),
+    metric("最大回撤", `-${fmtQty(Math.round(perf.maxDrawdown))}`, `账户 ${num(perf.maxDrawdownPct)}%`, "down"),
+    metric("收益回撤比", num(perf.returnOverDrawdown)),
+    metric("盈亏比", num(perf.profitFactor), "总盈利/总亏损"),
+    metric("期望值", perf.expectancy == null ? "—" : money(perf.expectancy), "每次平仓", tone(perf.expectancy)),
+    metric("平均盈利", perf.avgWin == null ? "—" : money(perf.avgWin), "", "up"),
+    metric("平均亏损", perf.avgLoss == null ? "—" : money(perf.avgLoss), "", "down"),
+    metric("最长连亏", `${perf.worstStreak} 次`),
+    metric(
+      "资金费",
+      perf.funding == null ? "未计入" : money(-perf.funding),
+      perf.funding == null
+        ? ""
+        : `已计入 · ${perf.fundingActualSettlements}/${perf.fundingSettlements} 次为实际费率${perf.fundingSettlements > perf.fundingActualSettlements ? `，其余按均值估算（${money(-perf.fundingEstimated)}）` : ""}`,
+      tone(perf.funding == null ? null : -perf.funding),
+    ),
+  ].join("");
+  ensureEquityChart();
+  equitySeries.setData(perf.equityCurve || []);
+  equityChart.timeScale().fitContent();
 }
 
 async function loadWatchlist() {
@@ -448,6 +517,7 @@ function params() {
     slow: Number(document.getElementById("slow").value),
     qty: Number(document.getElementById("qty").value),
     side: state.side,
+    strategy: state.strategy,
   };
 }
 
@@ -655,6 +725,17 @@ document.getElementById("tools").addEventListener("click", (event) => {
   });
 });
 
+document.getElementById("strategy-toggle").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  state.strategy = button.dataset.strategy;
+  const carverOn = state.strategy === "carver";
+  document.querySelectorAll("#strategy-toggle button").forEach((item) => item.classList.toggle("active", item === button));
+  document.getElementById("fast").disabled = carverOn;
+  document.getElementById("slow").disabled = carverOn;
+  document.getElementById("strategy-note").classList.toggle("hidden", !carverOn);
+});
+
 document.getElementById("side-toggle").addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
@@ -666,11 +747,189 @@ document.getElementById("tabs").addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
   document.querySelectorAll("#tabs button").forEach((item) => item.classList.toggle("active", item === button));
-  document.getElementById("panel-fills").classList.toggle("hidden", button.dataset.tab !== "fills");
-  document.getElementById("panel-positions").classList.toggle("hidden", button.dataset.tab !== "positions");
-  document.getElementById("panel-logs").classList.toggle("hidden", button.dataset.tab !== "logs");
+  if (button.dataset.tab === "forward") loadForward();
+  ["fills", "positions", "perf", "robust", "forward", "logs"].forEach((tab) => {
+    document.getElementById(`panel-${tab}`).classList.toggle("hidden", button.dataset.tab !== tab);
+  });
 });
 
+function day(unix) {
+  return stamp(unix).slice(0, 10);
+}
+
+function sharpeCell(value) {
+  if (value == null) return "background:transparent";
+  const strength = Math.min(1, Math.abs(value) / 2);
+  const rgb = value >= 0 ? "8,153,129" : "242,54,69";
+  return `background:rgba(${rgb},${(0.15 + strength * 0.6).toFixed(2)})`;
+}
+
+function renderRobust(result) {
+  const chosen = result.chosen;
+  const near = result.neighbours;
+  const walk = result.walkForward;
+  const num = (value) => (value == null ? "—" : Number(value).toFixed(2));
+  const oos = walk.oos;
+  const fixed = walk.fixed;
+  document.getElementById("robust-summary").innerHTML = [
+    `样本 <b>${day(result.from)} ~ ${day(result.to)}</b>，${result.bars} 根，方向 ${result.side === "both" ? "多空" : result.side === "long" ? "只做多" : "只做空"}`,
+    `当前 ${chosen.fast}/${chosen.slow}：盈亏 <b class="${chosen.pnl >= 0 ? "up" : "down"}">${money(chosen.pnl)}</b>，夏普 <b>${num(chosen.sharpe)}</b>，最大回撤 <b class="down">-${fmtQty(Math.round(chosen.maxDrawdown))}</b>`,
+    `邻域：<b>${near.profitable}/${near.count}</b> 组赚钱，中位夏普 <b>${num(near.medianSharpe)}</b>`,
+    `滚动检验（训练 ${walk.trainBars} 根 → 检验 ${walk.testBars} 根）：每段重选参数 盈亏 <b class="${oos && oos.pnl >= 0 ? "up" : "down"}">${oos ? money(oos.pnl) : "—"}</b>、夏普 <b>${num(oos && oos.sharpe)}</b>，${walk.positiveWindows}/${walk.windows.length} 段赚钱`,
+    `同一时段固定 ${chosen.fast}/${chosen.slow} 不换：盈亏 <b class="${fixed && fixed.pnl >= 0 ? "up" : "down"}">${fixed ? money(fixed.pnl) : "—"}</b>、夏普 <b>${num(fixed && fixed.sharpe)}</b>`,
+  ].map((line) => `<div>${line}</div>`).join("");
+
+  const head = `<tr><th>突破\\离场</th>${result.slows.map((slow) => `<th>${slow}</th>`).join("")}</tr>`;
+  const rows = result.fasts.map((fast) => {
+    const cells = result.slows.map((slow) => {
+      const cell = result.cells.find((item) => item.fast === fast && item.slow === slow);
+      if (!cell) return "<td>—</td>";
+      const mark = fast === chosen.fast && slow === chosen.slow ? "chosen" : "";
+      return `<td class="${mark}" style="${sharpeCell(cell.sharpe)}" title="盈亏 ${money(cell.pnl)} · 回撤 ${Math.round(cell.maxDrawdown)}">${num(cell.sharpe)}</td>`;
+    }).join("");
+    return `<tr><th>${fast}</th>${cells}</tr>`;
+  }).join("");
+  document.getElementById("robust-grid").innerHTML = `<div class="muted-note">夏普（年化），白框为当前参数</div><table>${head}${rows}</table>`;
+
+  const windowRows = walk.windows.map((item) => `
+    <tr>
+      <td>${day(item.from)} ~ ${day(item.to)}</td>
+      <td>${item.fast}/${item.slow}</td>
+      <td>${num(item.trainSharpe)}</td>
+      <td class="${item.testPnl >= 0 ? "up" : "down"}">${num(item.testSharpe)}</td>
+      <td class="${item.testPnl >= 0 ? "up" : "down"}">${money(item.testPnl)}</td>
+    </tr>`).join("");
+  document.getElementById("robust-walk").innerHTML = `
+    <table>
+      <thead><tr><th>检验时段</th><th>选中参数</th><th>训练夏普</th><th>检验夏普</th><th>检验盈亏</th></tr></thead>
+      <tbody>${windowRows || `<tr><td class="empty" colspan="5">数据不足</td></tr>`}</tbody>
+    </table>`;
+}
+
+async function runRobust() {
+  const button = document.getElementById("run-robust");
+  if (button.disabled) return;
+  button.disabled = true;
+  const summary = document.getElementById("robust-summary");
+  summary.textContent = "正在拉取约一年的历史 K 线并扫描参数，首次约需 20 秒…";
+  try {
+    const response = await fetch("/api/robust", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params()),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      summary.textContent = payload.error || "稳健性检查失败";
+      return;
+    }
+    renderRobust(payload);
+  } catch (error) {
+    summary.textContent = "无法连接桌面服务";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById("run-robust").addEventListener("click", runRobust);
+
+const INTERVAL_LABEL = { "1": "1m", "5": "5m", "15": "15m", "60": "1H", "240": "4H" };
+const SIDE_LABEL = { both: "多空", long: "只做多", short: "只做空" };
+const EVENT_LABEL = { start: "开始", stop: "停止", signal: "信号", fill: "成交", funding: "资金费" };
+let forwardSelected = null;
+let forwardRuns = [];
+
+function forwardStrategyText(run) {
+  return run.strategy === "carver" ? "Carver 趋势" : `突破 ${run.fast}/${run.slow}`;
+}
+
+function renderForwardEvents() {
+  const run = forwardRuns.find((item) => item.id === forwardSelected) || forwardRuns[0];
+  const body = document.getElementById("forward-events");
+  const title = document.getElementById("forward-events-title");
+  if (!run) {
+    title.textContent = "最近事件";
+    body.innerHTML = "";
+    return;
+  }
+  title.textContent = `最近事件 · ${forwardStrategyText(run)} · ${INTERVAL_LABEL[run.interval] || run.interval}`;
+  body.innerHTML = run.events.slice().reverse().map((event) => {
+    let detail = event.text || "";
+    if (event.type === "fill") {
+      detail = `${fmtQty(event.qty)} @ ${fmt(event.price)}，手续费 ${Number(event.fee).toFixed(2)}${event.pnl == null ? "" : `，本笔 ${money(event.pnl)}`} · ${event.text}`;
+    } else if (event.type === "funding") {
+      detail = `${event.text}，${money(event.amount)}`;
+    } else if (event.type === "signal") {
+      detail = `${event.text}`;
+    }
+    const tone = event.type === "fill" ? (event.side === "BUY" ? "up" : "down") : "";
+    return `<tr><td>${stamp(event.time)}</td><td>${EVENT_LABEL[event.type] || event.type}</td><td class="${tone}">${event.action || "—"}</td><td>${detail}</td></tr>`;
+  }).join("") || `<tr><td class="empty" colspan="4">等待下一根 K 线收盘</td></tr>`;
+}
+
+function renderForward(payload) {
+  forwardRuns = payload.runs || [];
+  if (!forwardRuns.some((run) => run.id === forwardSelected)) forwardSelected = forwardRuns.length ? forwardRuns[0].id : null;
+  const body = document.getElementById("forward-body");
+  body.innerHTML = forwardRuns.map((run) => `
+    <tr data-run="${run.id}" class="${run.id === forwardSelected ? "selected" : ""}">
+      <td>${stamp(run.startedAt)}</td>
+      <td>${forwardStrategyText(run)}</td>
+      <td>${INTERVAL_LABEL[run.interval] || run.interval}</td>
+      <td>${SIDE_LABEL[run.side] || run.side}</td>
+      <td>${positionText(run.position)}</td>
+      <td class="${run.pnl >= 0 ? "up" : "down"}">${money(run.pnl)}</td>
+      <td>${money(-run.funding)}</td>
+      <td>${run.signals}</td>
+      <td>${run.fills}</td>
+      <td>${run.status === "running" ? "运行中" : "已停止"}</td>
+      <td>${run.status === "running" ? `<button class="link-button" type="button" data-stop="${run.id}">停止</button>` : ""}</td>
+    </tr>`).join("") || `<tr><td class="empty" colspan="11">还没有前向模拟</td></tr>`;
+  if (payload.error) document.getElementById("forward-note").textContent = `后台出错：${payload.error}`;
+  renderForwardEvents();
+}
+
+async function loadForward() {
+  try {
+    const response = await fetch("/api/forward");
+    if (response.ok) renderForward(await response.json());
+  } catch (error) {
+    document.getElementById("forward-note").textContent = "无法连接桌面服务";
+  }
+}
+
+async function postForward(path, body) {
+  const note = document.getElementById("forward-note");
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    note.textContent = payload.error || "操作失败";
+    return;
+  }
+  note.textContent = "只记录模拟信号和模拟成交，不会向交易所下单。从开始后下一根收盘的 K 线起记录。";
+  renderForward(payload);
+}
+
+document.getElementById("start-forward").addEventListener("click", () => postForward("/api/forward/start", params()));
+document.getElementById("forward-body").addEventListener("click", (event) => {
+  const stop = event.target.closest("[data-stop]");
+  if (stop) {
+    postForward("/api/forward/stop", { id: stop.dataset.stop });
+    return;
+  }
+  const row = event.target.closest("tr[data-run]");
+  if (!row) return;
+  forwardSelected = row.dataset.run;
+  document.querySelectorAll("#forward-body tr").forEach((item) => item.classList.toggle("selected", item === row));
+  renderForwardEvents();
+});
+setInterval(() => {
+  if (!document.getElementById("panel-forward").classList.contains("hidden")) loadForward();
+}, 10000);
 document.getElementById("run").addEventListener("click", runBacktest);
 document.getElementById("symbol-btn").addEventListener("click", () => {
   document.querySelector(".watch-row.active")?.scrollIntoView({ block: "nearest" });

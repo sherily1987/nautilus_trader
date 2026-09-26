@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 
 
@@ -43,16 +44,30 @@ def is_live(symbol: str) -> bool:
     return symbol in LIVE_SYMBOLS
 
 
+RATE_LIMIT_RETRIES = 3
+
+
 def _get(path: str) -> dict:
     request = urllib.request.Request(
         BASE + path,
         headers={"User-Agent": "nautilus-desk", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=12) as response:
-        payload = json.load(response)
-    if payload.get("code") != "0":
-        raise RuntimeError(payload.get("msg") or "行情获取失败")
-    return payload
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                payload = json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < RATE_LIMIT_RETRIES:
+                time.sleep(1.0 + attempt)
+                continue
+            raise
+        if payload.get("code") == "50011" and attempt < RATE_LIMIT_RETRIES:
+            time.sleep(1.0 + attempt)
+            continue
+        if payload.get("code") != "0":
+            raise RuntimeError(payload.get("msg") or "行情获取失败")
+        return payload
+    raise RuntimeError("行情获取失败")
 
 
 def _bar(row: list) -> dict:
@@ -92,6 +107,26 @@ def _history(interval: str, limit: int) -> list[dict]:
             break
     chosen = list(reversed(rows[:limit]))
     return [_bar(row) for row in chosen]
+
+
+RESEARCH_REFRESH_SECONDS = 1800
+RESEARCH_BARS = {"15": 6000, "60": 6000, "240": 2400}
+_RESEARCH: dict[str, tuple[float, list[dict]]] = {}
+
+
+def research_bars(symbol: str, interval: str, limit: int) -> list[dict]:
+    """Up to `limit` closed candles for offline research, cached for half an hour."""
+    if symbol not in LIVE_SYMBOLS or interval not in OKX_BAR:
+        raise ValueError("这个品种没有实盘行情")
+    key = f"{interval}:{limit}"
+    with _LOCK:
+        cached = _RESEARCH.get(key)
+    if cached is not None and time.monotonic() - cached[0] < RESEARCH_REFRESH_SECONDS:
+        return cached[1]
+    bars = [bar for bar in _history(interval, limit) if bar["closed"]]
+    with _LOCK:
+        _RESEARCH[key] = (time.monotonic(), bars)
+    return bars
 
 
 def _fetch(symbol: str, interval: str, limit: int) -> list[dict]:
@@ -211,6 +246,39 @@ def with_taker(symbol: str, interval: str, bars: list[dict]) -> list[dict]:
         else:
             out.append({**bar, "buyVol": pair[0], "sellVol": pair[1]})
     return out
+
+
+FUNDING_REFRESH_SECONDS = 600
+_FUNDING: dict[str, object] = {}
+
+
+def funding_history() -> dict[int, float]:
+    """Settled funding rates keyed by settlement time in seconds. OKX keeps about three months."""
+    with _LOCK:
+        cached = _FUNDING.get("rates")
+        fetched_at = float(_FUNDING.get("at", 0.0))
+    if cached is not None and time.monotonic() - fetched_at < FUNDING_REFRESH_SECONDS:
+        return cached
+    rates: dict[int, float] = {}
+    after = None
+    for _ in range(10):
+        path = f"/api/v5/public/funding-rate-history?instId={INST_ID}&limit=100"
+        if after is not None:
+            path += f"&after={after}"
+        page = _get(path)["data"]
+        if not page:
+            break
+        for row in page:
+            rate = row.get("realizedRate") or row.get("fundingRate")
+            rates[int(row["fundingTime"]) // 1000] = float(rate)
+        after = page[-1]["fundingTime"]
+        if len(page) < 100:
+            break
+        time.sleep(0.25)
+    with _LOCK:
+        _FUNDING["rates"] = rates
+        _FUNDING["at"] = time.monotonic()
+    return rates
 
 
 def ticker(symbol: str) -> dict:

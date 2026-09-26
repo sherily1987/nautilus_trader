@@ -34,6 +34,7 @@ from nautilus_trader.model import Venue
 from nautilus_trader.testkit.providers import TestInstrumentProvider
 from nautilus_trader.trading import Strategy
 
+import carver
 import market
 
 
@@ -344,16 +345,27 @@ class BreakoutStrategy(Strategy):
         meta = self._orders.get(str(event.client_order_id), {})
         meta["filled"] = True
         was = self._pos
-        self._pos += qty if buy else -qty
+        signed = qty if buy else -qty
+        self._pos = round(was + signed, max(self._size_precision, 0))
         trade_pnl = None
         step = self._qty_step()
-        if abs(was) < step and abs(self._pos) >= step:
-            self._entry_px = price
-            self._entry_fee = commission
-        elif abs(self._pos) < step and abs(was) >= step:
-            closed = abs(was)
-            gross = (price - self._entry_px) * closed if was > 0 else (self._entry_px - price) * closed
-            trade_pnl = gross - self._entry_fee - commission
+        if abs(was) < step or (was > 0) == (signed > 0):
+            held = abs(was) if abs(was) >= step else 0.0
+            self._entry_px = (self._entry_px * held + price * qty) / (held + qty)
+            self._entry_fee = (self._entry_fee if held else 0.0) + commission
+        else:
+            closing = min(abs(was), qty)
+            entry_fee = self._entry_fee * closing / abs(was)
+            gross = (price - self._entry_px) * closing * (1 if was > 0 else -1)
+            trade_pnl = gross - entry_fee - commission * closing / qty
+            self._entry_fee -= entry_fee
+            if qty - closing >= step:
+                self._entry_px = price
+                self._entry_fee = commission * (qty - closing) / qty
+            elif abs(self._pos) < step:
+                self._pos = 0.0
+                self._entry_px = 0.0
+                self._entry_fee = 0.0
         self.fills.append(
             {
                 "time": int(event.ts_event // 1_000_000_000),
@@ -502,17 +514,94 @@ def _btc_perpetual() -> CryptoPerpetual:
     )
 
 
+class CarverStrategy(BreakoutStrategy):
+    """Scale a position with the Carver breakout forecast and recent volatility."""
+
+    def __init__(
+        self,
+        bar_type: BarType,
+        quantity: float,
+        side: str,
+        size_precision: int,
+        lookbacks: tuple[int, ...],
+        warmup: list[float],
+    ) -> None:
+        super().__init__(bar_type, 0, 0, quantity, side, size_precision)
+        self._signal = carver.CarverSignal(quantity, self._qty_step(), side, lookbacks)
+        for close in warmup:
+            self._signal.update(close)
+
+    def on_start(self) -> None:
+        self.subscribe_bars(self._bar_type)
+        direction = {"both": "多空", "long": "只做多", "short": "只做空"}.get(self._side, self._side)
+        days = "/".join(str(day) for day in carver.LOOKBACK_DAYS)
+        self._note(f"Carver 趋势已启动，{direction}，回看 {days} 天，基准仓位 {self._quantity:g}")
+
+    def on_bar(self, bar: Bar) -> None:
+        close = bar.close.as_double()
+        self._bar_ts = bar.ts_event
+        self._count += 1
+        self._signal.update(close)
+        current = self._net_qty()
+        wanted = self._signal.next_position(current)
+        delta = wanted - current
+        if abs(delta) < self._qty_step():
+            return
+        order_side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+        reason = f"预测 {self._signal.forecast:+.1f}，目标 {wanted:+.3f}，当前 {current:+.3f}"
+        self._submit(order_side, abs(delta), _scale_action(current, wanted), reason, close)
+
+
+def _scale_action(current: float, wanted: float) -> str:
+    if abs(current) < 1e-12:
+        return "开多" if wanted > 0 else "开空"
+    if abs(wanted) < 1e-12:
+        return "平多" if current > 0 else "平空"
+    if (current > 0) != (wanted > 0):
+        return "反手做多" if wanted > 0 else "反手做空"
+    if abs(wanted) > abs(current):
+        return "加多" if wanted > 0 else "加空"
+    return "减多" if current > 0 else "减空"
+
+
 def _instrument(symbol: str):
     if symbol == "BTCUSDT":
         return _btc_perpetual()
     return TestInstrumentProvider.default_fx_ccy(symbol=symbol, venue=Venue(VENUE_NAME))
 
 
-def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, side: str) -> dict:
-    """Run one breakout backtest and return chart-ready JSON."""
+STRATEGIES = {"breakout", "carver"}
+CARVER_INTERVALS = {"60", "240"}
+
+
+def _carver_warmup(symbol: str, interval: str, first_time: int, lookbacks: tuple[int, ...]) -> list[float]:
+    """Closes before the backtest window, enough to fill the longest lookback."""
+    history = market.research_bars(symbol, interval, market.RESEARCH_BARS[interval])
+    closes = [bar["close"] for bar in history if bar["time"] < first_time]
+    needed = max(lookbacks) + carver.LONG_VOL_BARS
+    if len(closes) < max(lookbacks):
+        raise ValueError("历史数据不足，无法预热 Carver 信号")
+    return closes[-needed:]
+
+
+def run_backtest(
+    symbol: str,
+    interval: str,
+    fast: int,
+    slow: int,
+    qty: float,
+    side: str,
+    strategy: str = "breakout",
+) -> dict:
+    """Run one backtest and return chart-ready JSON."""
     _validate(symbol, interval, fast, slow, qty)
     if side not in {"both", "long", "short"}:
         raise ValueError("方向无效")
+    if strategy not in STRATEGIES:
+        raise ValueError("未知策略")
+    if strategy == "carver" and (not market.is_live(symbol) or interval not in CARVER_INTERVALS):
+        raise ValueError("Carver 策略只支持 BTC 永续的 1H、4H")
+    strategy_name = strategy
 
     if market.is_live(symbol):
         payload = live_view(symbol, interval, fast, slow)
@@ -579,7 +668,18 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
         )
         engine.add_instrument(instrument)
         engine.add_data(feed)
-        strategy = BreakoutStrategy(bar_type, fast, slow, float(qty), side, instrument.size_precision)
+        if strategy_name == "carver":
+            lookbacks = carver.lookbacks_for(INTERVALS[interval])
+            strategy = CarverStrategy(
+                bar_type,
+                float(qty),
+                side,
+                instrument.size_precision,
+                lookbacks,
+                _carver_warmup(symbol, interval, bars[0]["time"], lookbacks),
+            )
+        else:
+            strategy = BreakoutStrategy(bar_type, fast, slow, float(qty), side, instrument.size_precision)
         engine.add_strategy(strategy)
         with _LOCK:
             engine.run()
@@ -588,7 +688,8 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
             _position_row(position, SYMBOLS[symbol]["digits"])
             for position in (*engine.cache.positions_closed(), *engine.cache.positions_open())
         ]
-        stats = _stats(engine, venue, positions, strategy.fills, SYMBOLS[symbol]["currency"])
+        performance = _performance(bars, strategy.fills, interval, _funding_events(symbol, bars, interval))
+        stats = _stats(performance["curvePnl"], positions, strategy.fills, SYMBOLS[symbol]["currency"])
         markers = _markers(strategy.fills)
         pending = strategy.pending()
     finally:
@@ -600,11 +701,13 @@ def run_backtest(symbol: str, interval: str, fast: int, slow: int, qty: float, s
             "positions": positions,
             "markers": markers,
             "stats": stats,
+            "performance": performance,
             "logs": strategy.logs,
             "fast": fast,
             "slow": slow,
             "qty": qty,
             "side": side,
+            "strategy": strategy_name,
         },
     )
     return payload
@@ -630,13 +733,11 @@ def _position_row(position, digits: int) -> dict:
     }
 
 
-def _stats(engine: BacktestEngine, venue: Venue, positions: list[dict], fills: list[dict], currency: str) -> dict:
+def _stats(total: float, positions: list[dict], fills: list[dict], currency: str) -> dict:
+    # Taken from the mark-to-close curve: the portfolio marks open positions at
+    # the last trade tick, which is the final bar's open.
     closed = [item for item in fills if item["pnl"] is not None]
     wins = [item for item in closed if item["pnl"] > 0]
-    pnl_map = engine.portfolio.total_pnls(venue)
-    total = 0.0
-    for money in pnl_map.values():
-        total += _num(money)
     return {
         "starting": STARTING_BALANCE,
         "pnl": total,
@@ -647,6 +748,135 @@ def _stats(engine: BacktestEngine, venue: Venue, positions: list[dict], fills: l
         "winRate": (len(wins) / len(closed) * 100) if closed else None,
         "openPositions": sum(1 for item in positions if item["status"] == "持仓"),
         "currency": currency,
+    }
+
+
+FUNDING_PERIOD_SECONDS = 8 * 3600
+
+
+def _funding_events(symbol: str, bars: list[dict], interval: str) -> list[tuple[int, float, bool]]:
+    """Funding settlements inside the bars: (time, rate, estimated).
+
+    Settlements older than the venue's history use the mean of the history.
+    """
+    if not market.is_live(symbol) or not bars:
+        return []
+    try:
+        history = market.funding_history()
+    except Exception:
+        return []
+    if not history:
+        return []
+    mean = sum(history.values()) / len(history)
+    start = bars[0]["time"]
+    end = bars[-1]["time"] + INTERVALS[interval] * 60
+    first = -(-start // FUNDING_PERIOD_SECONDS) * FUNDING_PERIOD_SECONDS
+    events = []
+    for moment in range(first, end + 1, FUNDING_PERIOD_SECONDS):
+        rate = history.get(moment)
+        events.append((moment, mean if rate is None else rate, rate is None))
+    return events
+
+
+def _equity_curve(
+    bars: list[dict],
+    fills: list[dict],
+    interval: str,
+    events: list[tuple[int, float, bool]],
+) -> tuple[list[dict], float, float]:
+    """Mark-to-close PnL after every bar, with fees and funding.
+
+    Returns the curve, total funding paid, and the estimated part of it.
+    """
+    queue = sorted((item for item in fills if item["status"] == "已成交"), key=lambda item: item["time"])
+    bar_seconds = INTERVALS[interval] * 60
+    position = 0.0
+    average = 0.0
+    realized = 0.0
+    funding_paid = 0.0
+    funding_estimated = 0.0
+    cursor = 0
+    event_cursor = 0
+    curve = []
+    for bar in bars:
+        while cursor < len(queue) and queue[cursor]["time"] <= bar["time"]:
+            fill = queue[cursor]
+            cursor += 1
+            signed = fill["qty"] if fill["side"] == "BUY" else -fill["qty"]
+            realized -= fill["commission"] or 0.0
+            if position == 0 or (position > 0) == (signed > 0):
+                total = abs(position) + abs(signed)
+                average = (average * abs(position) + fill["price"] * abs(signed)) / total
+                position += signed
+                continue
+            closing = min(abs(position), abs(signed))
+            realized += (fill["price"] - average) * closing * (1 if position > 0 else -1)
+            position += signed
+            if abs(position) < 1e-12:
+                position = 0.0
+                average = 0.0
+            elif (position > 0) == (signed > 0):
+                average = fill["price"]
+        while event_cursor < len(events) and events[event_cursor][0] <= bar["time"] + bar_seconds:
+            _, rate, estimated = events[event_cursor]
+            event_cursor += 1
+            payment = position * bar["close"] * rate
+            realized -= payment
+            funding_paid += payment
+            if estimated:
+                funding_estimated += payment
+        curve.append({"time": bar["time"], "value": realized + (bar["close"] - average) * position})
+    return curve, funding_paid, funding_estimated
+
+
+def _performance(bars: list[dict], fills: list[dict], interval: str, events: list[tuple[int, float, bool]]) -> dict:
+    curve, funding_paid, funding_estimated = _equity_curve(bars, fills, interval, events)
+    closed = [item["pnl"] for item in fills if item.get("pnl") is not None]
+    wins = [value for value in closed if value > 0]
+    losses = [value for value in closed if value <= 0]
+
+    peak = 0.0
+    max_drawdown = 0.0
+    for point in curve:
+        peak = max(peak, point["value"])
+        max_drawdown = max(max_drawdown, peak - point["value"])
+
+    returns = []
+    for previous, current in zip(curve, curve[1:]):
+        base = STARTING_BALANCE + previous["value"]
+        returns.append((current["value"] - previous["value"]) / base)
+    sharpe = None
+    if len(returns) > 1:
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+        if variance > 0:
+            bars_per_year = 365 * 24 * 60 / INTERVALS[interval]
+            sharpe = mean / variance**0.5 * bars_per_year**0.5
+
+    streak = 0
+    worst_streak = 0
+    for value in closed:
+        streak = streak + 1 if value <= 0 else 0
+        worst_streak = max(worst_streak, streak)
+
+    final = curve[-1]["value"] if curve else 0.0
+    gross_loss = -sum(losses)
+    return {
+        "sharpe": sharpe,
+        "maxDrawdown": max_drawdown,
+        "maxDrawdownPct": max_drawdown / STARTING_BALANCE * 100,
+        "profitFactor": sum(wins) / gross_loss if gross_loss > 0 else None,
+        "expectancy": sum(closed) / len(closed) if closed else None,
+        "avgWin": sum(wins) / len(wins) if wins else None,
+        "avgLoss": sum(losses) / len(losses) if losses else None,
+        "worstStreak": worst_streak,
+        "returnOverDrawdown": final / max_drawdown if max_drawdown > 0 else None,
+        "curvePnl": final,
+        "equityCurve": curve,
+        "funding": funding_paid if events else None,
+        "fundingEstimated": funding_estimated if events else None,
+        "fundingActualSettlements": sum(1 for event in events if not event[2]),
+        "fundingSettlements": len(events),
     }
 
 

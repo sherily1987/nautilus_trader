@@ -12,6 +12,8 @@ from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 import engine
+import forward
+import research
 
 
 HOST = "127.0.0.1"
@@ -19,6 +21,7 @@ PORT = 8765
 STATIC = Path(__file__).resolve().parent / "static"
 READY = False
 BOOT_ERROR = ""
+FORWARD = forward.ForwardManager()
 
 
 class DeskHandler(BaseHTTPRequestHandler):
@@ -39,6 +42,9 @@ class DeskHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/live":
             self._live(parse_qs(parsed.query))
             return
+        if parsed.path == "/api/forward":
+            self._json(FORWARD.snapshot())
+            return
         if parsed.path == "/":
             self._file(STATIC / "index.html")
             return
@@ -48,21 +54,51 @@ class DeskHandler(BaseHTTPRequestHandler):
         if not READY:
             self._json({"error": BOOT_ERROR or "引擎正在启动"}, status=503)
             return
-        if urlparse(self.path).path != "/api/backtest":
+        path = urlparse(self.path).path
+        if path not in {"/api/backtest", "/api/robust", "/api/forward/start", "/api/forward/stop"}:
             self._json({"error": "未知接口"}, status=404)
             return
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b"{}"
         try:
             body = json.loads(raw.decode("utf-8"))
-            result = engine.run_backtest(
-                symbol=str(body.get("symbol", "EURUSD")),
-                interval=str(body.get("interval", "15")),
-                fast=int(body["fast"]) if "fast" in body else 120,
-                slow=int(body["slow"]) if "slow" in body else 10,
-                qty=float(body["qty"]) if "qty" in body else engine.SYMBOLS.get(str(body.get("symbol", "EURUSD")), {}).get("qty", 100_000),
-                side=str(body.get("side", "both")),
-            )
+            symbol = str(body.get("symbol", "EURUSD"))
+            interval = str(body.get("interval", "15"))
+            fast = int(body["fast"]) if "fast" in body else 120
+            slow = int(body["slow"]) if "slow" in body else 10
+            side = str(body.get("side", "both"))
+            if path == "/api/forward/start":
+                FORWARD.start(
+                    {
+                        "symbol": symbol,
+                        "interval": interval,
+                        "fast": fast,
+                        "slow": slow,
+                        "qty": float(body.get("qty", 1)),
+                        "side": side,
+                        "strategy": str(body.get("strategy", "breakout")),
+                    },
+                )
+                result = FORWARD.snapshot()
+            elif path == "/api/forward/stop":
+                FORWARD.stop(str(body.get("id", "")))
+                result = FORWARD.snapshot()
+            elif path == "/api/robust":
+                if side not in {"both", "long", "short"}:
+                    raise ValueError("方向无效")
+                if body.get("strategy") == "carver":
+                    raise ValueError("Carver 策略用书中固定的回看周期，不做参数扫描；请切回通道突破再检查")
+                result = research.robustness(symbol, interval, fast, slow, side)
+            else:
+                result = engine.run_backtest(
+                    symbol=symbol,
+                    interval=interval,
+                    fast=fast,
+                    slow=slow,
+                    qty=float(body["qty"]) if "qty" in body else engine.SYMBOLS.get(symbol, {}).get("qty", 100_000),
+                    side=side,
+                    strategy=str(body.get("strategy", "breakout")),
+                )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._json({"error": str(exc) or "参数无效"}, status=400)
             return
@@ -137,6 +173,7 @@ def _warm() -> None:
         engine.watchlist()
         READY = True
         threading.Thread(target=engine.market.warm_taker, daemon=True).start()
+        threading.Thread(target=FORWARD.loop, daemon=True).start()
     except Exception as exc:
         BOOT_ERROR = str(exc)
 
